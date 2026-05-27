@@ -14,6 +14,7 @@ const STORAGE_KEYS = {
   weeklyReflects:   "ck_weekly_reflects",
   monthlyReflects:  "ck_monthly_reflects",
   adminComments:    "ck_admin_comments",
+  directInvoices:   "ck_direct_invoices",   // 直送・請求書入力
 };
 function loadStorage(key, fallback) {
   try {
@@ -418,48 +419,41 @@ function generateYearlyAdvice(yearlyGoal, lastResult, currentResult) {
 // ============================================================
 // 店長育成スコア計算
 // ============================================================
-function calcManagerScore(result, yearlyGoal, weeklyReflects, monthlyReflects, storeId, month) {
+function calcManagerScore(result, yearlyGoal, weeklyReflects, monthlyReflects, storeId, month, directInvoices) {
   if (!result || !yearlyGoal) return { score: 0, breakdown: {}, rank: "D" };
 
   const target = yearlyGoal.monthlySalesTargets?.[month] || yearlyGoal.annualSalesTarget / 12;
   const salesRate = target > 0 ? result.sales / target * 100 : 0;
-
-  // ① 売上達成率 25点
   const salesScore = Math.min(25, Math.round(salesRate / 100 * 25));
 
-  // ② 利益達成率（食材費+備品費+人件費の費率で代替）20点
+  // 直送費込みの費率で評価
+  const { foodTotal, supplyTotal } = calcTotalRates(result, directInvoices, storeId, month);
+
   const totalCostRate = result.sales > 0
-    ? pct(result.laborCost + result.foodOrderCost + result.supplyOrderCost, result.sales) : 100;
+    ? pct(result.laborCost + foodTotal + supplyTotal, result.sales) : 100;
   const profitScore = totalCostRate <= 65 ? 20 : totalCostRate <= 70 ? 15 : totalCostRate <= 75 ? 10 : 5;
 
-  // ③ 人件費管理 15点
-  const laborRate = result.sales > 0 ? pct(result.laborCost, result.sales) : 100;
+  const laborRate  = result.sales > 0 ? pct(result.laborCost, result.sales) : 100;
   const target_lr = yearlyGoal.laborRateTarget || 30;
   const laborScore = laborRate <= target_lr ? 15 : laborRate <= target_lr + 2 ? 10 : laborRate <= target_lr + 5 ? 5 : 0;
 
-  // ④ 食材費管理 15点
-  const foodRate = result.sales > 0 ? pct(result.foodOrderCost, result.sales) : 100;
+  const foodRate = result.sales > 0 ? pct(foodTotal, result.sales) : 100;
   const target_fr = yearlyGoal.foodRateTarget || 30;
   const foodScore = foodRate <= target_fr ? 15 : foodRate <= target_fr + 2 ? 10 : foodRate <= target_fr + 5 ? 5 : 0;
 
-  // ⑤ 備品費管理 5点
-  const supplyRate = result.sales > 0 ? pct(result.supplyOrderCost, result.sales) : 100;
+  const supplyRate = result.sales > 0 ? pct(supplyTotal, result.sales) : 100;
   const target_sr = yearlyGoal.supplyRateTarget || 5;
   const supplyScore = supplyRate <= target_sr ? 5 : supplyRate <= target_sr + 1 ? 3 : 0;
 
-  // ⑥ 発注ルール遵守 5点
   const dlRate = result.totalOrders > 0 ? result.onTimeOrders / result.totalOrders * 100 : 100;
   const dlScore = dlRate >= 95 ? 5 : dlRate >= 85 ? 3 : dlRate >= 70 ? 1 : 0;
 
-  // ⑦ 週次振り返り提出 5点
   const thisMonthWeekly = (weeklyReflects || []).filter(r => r.storeId === storeId && r.month === month);
   const weeklyScore = thisMonthWeekly.length >= 4 ? 5 : thisMonthWeekly.length >= 2 ? 3 : thisMonthWeekly.length >= 1 ? 1 : 0;
 
-  // ⑧ 改善行動の実行 5点（週次振り返りの改善行動チェック）
   const actionDone = thisMonthWeekly.filter(r => r.actionItems && r.actionItems.length > 0).length;
   const actionScore = actionDone >= 3 ? 5 : actionDone >= 2 ? 3 : actionDone >= 1 ? 2 : 0;
 
-  // ⑨ 月次振り返り提出 5点
   const monthlyReflect = (monthlyReflects || []).find(r => r.storeId === storeId && r.month === month);
   const monthlyScore = monthlyReflect ? 5 : 0;
 
@@ -467,12 +461,12 @@ function calcManagerScore(result, yearlyGoal, weeklyReflects, monthlyReflects, s
   const rank = total >= 90 ? "A" : total >= 80 ? "B" : total >= 70 ? "C" : "D";
 
   return {
-    score: total,
-    rank,
+    score: total, rank,
     breakdown: { salesScore, profitScore, laborScore, foodScore, supplyScore, dlScore, weeklyScore, actionScore, monthlyScore },
     rates: { salesRate, laborRate, foodRate, supplyRate, dlRate },
   };
 }
+
 
 // ============================================================
 // 店長向け自動アドバイス（強化版）
@@ -613,6 +607,33 @@ function buildAdminCommentCandidate(storeId, weekDiag, latestReflect) {
   let base = commentMap[issue.key] || "";
   if(align?.level==="少しズレ") base += " 振り返りの視点は良いですが、"+align.msg;
   return base;
+}
+
+// ============================================================
+// 直送・請求書費用の合算ヘルパー
+// ============================================================
+// directInvoices = [{id, storeId, month, vendor, category:"食材"|"備品", amount, invoiceDate, payDate, memo, note, enteredBy, createdAt}]
+
+function getDirectCosts(directInvoices, storeId, month) {
+  const records = (directInvoices || []).filter(r => r.storeId === storeId && r.month === month);
+  const foodDirect  = records.filter(r => r.category === "食材").reduce((s, r) => s + (r.amount||0), 0);
+  const supplyDirect= records.filter(r => r.category === "備品").reduce((s, r) => s + (r.amount||0), 0);
+  return { foodDirect, supplyDirect, count: records.length };
+}
+
+// result（月次実績）＋直送費用を合算して総費率を返す
+function calcTotalRates(result, directInvoices, storeId, month) {
+  if (!result) return { foodTotal:0, supplyTotal:0, foodRate:0, supplyRate:0, foodDirect:0, supplyDirect:0 };
+  const { foodDirect, supplyDirect } = getDirectCosts(directInvoices, storeId, month);
+  const foodTotal   = (result.foodOrderCost   || 0) + foodDirect;
+  const supplyTotal = (result.supplyOrderCost || 0) + supplyDirect;
+  const sales = result.sales || 1;
+  return {
+    foodDirect, supplyDirect,
+    foodTotal, supplyTotal,
+    foodRate:   pct(foodTotal,   sales),
+    supplyRate: pct(supplyTotal, sales),
+  };
 }
 
 function generateGoalAdvice(goal, m) {
@@ -1420,13 +1441,13 @@ function GoalSettingAdmin({storeGoals, setStoreGoals}) {
 // ============================================================
 // 店長スコア表示カード
 // ============================================================
-function ManagerScoreCard({storeId, yearlyGoals, monthlyResults, weeklyReflects, monthlyReflects, onNav}) {
+function ManagerScoreCard({storeId, yearlyGoals, monthlyResults, weeklyReflects, monthlyReflects, onNav, directInvoices}) {
   const goal = yearlyGoals.find(g => g.storeId===storeId && g.year===THIS_YEAR);
   const result = monthlyResults.find(r => r.storeId===storeId && r.month===THIS_MONTH);
   if (!goal || !result) return (
     <div className="card"><div className="ct">🏆 今月の店長スコア</div><div className="txm fs11">実績データが入力されるとスコアが表示されます。</div></div>
   );
-  const { score, rank, breakdown, rates } = calcManagerScore(result, goal, weeklyReflects, monthlyReflects, storeId, THIS_MONTH);
+  const { score, rank, breakdown, rates } = calcManagerScore(result, goal, weeklyReflects, monthlyReflects, storeId, THIS_MONTH, directInvoices);
   const target = goal.monthlySalesTargets?.[THIS_MONTH] || goal.annualSalesTarget/12;
   const rankInfo = { A:["🏆","A評価","インセンティブ満額対象","var(--ac)","#D1FAE5"], B:["⭐","B評価","インセンティブ一部対象","#D97706","#FEF3C7"], C:["📈","C評価","改善チャレンジ中","#7C3AED","#EDE9FE"], D:["💪","D評価","面談でサポートします","var(--dg)","#FEE2E2"] };
   const [ri, rl, rm, rc, rbg] = rankInfo[rank] || rankInfo.D;
@@ -1702,7 +1723,7 @@ function MonthlyReflectScreen({user, monthlyReflects, setMonthlyReflects, adminC
 // ============================================================
 // 店長：インセンティブ確認画面
 // ============================================================
-function IncentiveCheckScreen({user, yearlyGoals, monthlyResults, weeklyReflects, monthlyReflects}) {
+function IncentiveCheckScreen({user, yearlyGoals, monthlyResults, weeklyReflects, monthlyReflects, directInvoices}) {
   const [showDetail, setShowDetail] = useState(false);
   const goal=yearlyGoals.find(g=>g.storeId===user.storeId&&g.year===THIS_YEAR);
   const result=monthlyResults.find(r=>r.storeId===user.storeId&&r.month===THIS_MONTH);
@@ -1718,8 +1739,10 @@ function IncentiveCheckScreen({user, yearlyGoals, monthlyResults, weeklyReflects
     </div>
   );
 
-  const {score,rank,breakdown,rates}=calcManagerScore(result,goal,weeklyReflects,monthlyReflects,user.storeId,THIS_MONTH);
+  const {score,rank,breakdown,rates}=calcManagerScore(result,goal,weeklyReflects,monthlyReflects,user.storeId,THIS_MONTH,directInvoices);
   const target=goal.monthlySalesTargets?.[THIS_MONTH]||goal.annualSalesTarget/12;
+  const { foodDirect, supplyDirect, foodTotal, supplyTotal, foodRate:totalFoodRate, supplyRate:totalSupplyRate } = calcTotalRates(result, directInvoices, user.storeId, THIS_MONTH);
+  const hasDirect = foodDirect > 0 || supplyDirect > 0;
   const rankCfg={
     A:{emoji:"🏆",label:"A評価",inc:"インセンティブ満額対象",color:"var(--ac)",bg:"#D1FAE5",bdr:"#10B981"},
     B:{emoji:"⭐",label:"B評価",inc:"インセンティブ一部対象",color:"#D97706",bg:"#FEF3C7",bdr:"#F59E0B"},
@@ -1794,6 +1817,36 @@ function IncentiveCheckScreen({user, yearlyGoals, monthlyResults, weeklyReflects
         </div>
       )}
 
+      {/* 費用内訳（直送費含む） */}
+      {hasDirect && (
+        <div className="card" style={{marginBottom:11}}>
+          <div className="ct">💡 食材費・備品費の内訳</div>
+          <div className="al ai" style={{marginBottom:9}}><span>ℹ️</span>CK発注分だけでなく、店舗直送の請求書分も含めた正しい数字です。</div>
+          {foodTotal>0&&(
+            <div className="rate-row">
+              <div className="rate-label">食材費率（合計）</div>
+              <div style={{fontWeight:800,color:totalFoodRate<=(goal.foodRateTarget||30)?"var(--ac)":"var(--dg)"}}>{totalFoodRate}%</div>
+            </div>
+          )}
+          {foodDirect>0&&(
+            <div style={{fontSize:11,color:"var(--tx3)",paddingLeft:8,marginBottom:4}}>
+              CK発注 ¥{fmt(result.foodOrderCost||0)} ＋ 直送 ¥{fmt(foodDirect)} = ¥{fmt(foodTotal)}
+            </div>
+          )}
+          {supplyTotal>0&&(
+            <div className="rate-row">
+              <div className="rate-label">備品費率（合計）</div>
+              <div style={{fontWeight:800,color:totalSupplyRate<=(goal.supplyRateTarget||5)?"var(--ac)":"var(--dg)"}}>{totalSupplyRate}%</div>
+            </div>
+          )}
+          {supplyDirect>0&&(
+            <div style={{fontSize:11,color:"var(--tx3)",paddingLeft:8}}>
+              CK発注 ¥{fmt(result.supplyOrderCost||0)} ＋ 直送 ¥{fmt(supplyDirect)} = ¥{fmt(supplyTotal)}
+            </div>
+          )}
+        </div>
+      )}
+
       <button className="btn bsec" onClick={()=>setShowDetail(!showDetail)} style={{marginBottom:11}}>
         {showDetail?"▲ 詳しい内訳を閉じる":"▼ 詳しい内訳を見る"}
       </button>
@@ -1819,7 +1872,7 @@ function IncentiveCheckScreen({user, yearlyGoals, monthlyResults, weeklyReflects
 // ============================================================
 // 管理者：全店舗インセンティブ一覧
 // ============================================================
-function AllStoreIncentiveScreen({yearlyGoals, monthlyResults, weeklyReflects, monthlyReflects, adminComments, setAdminComments}) {
+function AllStoreIncentiveScreen({yearlyGoals, monthlyResults, weeklyReflects, monthlyReflects, adminComments, setAdminComments, directInvoices}) {
   const [selStore,setSelStore]=useState(null);
   const [commentText,setCommentText]=useState("");
   const [commentTarget,setCommentTarget]=useState(null);
@@ -1845,7 +1898,7 @@ function AllStoreIncentiveScreen({yearlyGoals, monthlyResults, weeklyReflects, m
               if(!goal||!result){
                 return(<tr key={store.id}><td style={{padding:"5px",border:"1px solid var(--bd)",fontWeight:700}}>{store.name}</td><td colSpan={6} style={{padding:"5px",border:"1px solid var(--bd)",color:"var(--tx3)",textAlign:"center"}}>データなし</td></tr>);
               }
-              const {score,rank,breakdown,rates}=calcManagerScore(result,goal,weeklyReflects,monthlyReflects,store.id,THIS_MONTH);
+              const {score,rank,breakdown,rates}=calcManagerScore(result,goal,weeklyReflects,monthlyReflects,store.id,THIS_MONTH,directInvoices);
               const target=goal.monthlySalesTargets?.[THIS_MONTH]||goal.annualSalesTarget/12;
               const salesRate=target>0?Math.round(result.sales/target*100):0;
               const rankColor={A:"var(--ac)",B:"#D97706",C:"#7C3AED",D:"var(--dg)"};
@@ -1877,7 +1930,7 @@ function AllStoreIncentiveScreen({yearlyGoals, monthlyResults, weeklyReflects, m
         const result=monthlyResults.find(r=>r.storeId===selStore&&r.month===THIS_MONTH);
         const wr=(weeklyReflects||[]).filter(r=>r.storeId===selStore).sort((a,b)=>b.createdAt-a.createdAt).slice(0,3);
         const mr=(monthlyReflects||[]).find(r=>r.storeId===selStore&&r.month===THIS_MONTH);
-        const sc=goal&&result?calcManagerScore(result,goal,weeklyReflects,monthlyReflects,selStore,THIS_MONTH):null;
+        const sc=goal&&result?calcManagerScore(result,goal,weeklyReflects,monthlyReflects,selStore,THIS_MONTH,directInvoices):null;
         return(
           <div className="card" style={{marginTop:11}}>
             <div className="ct">📋 {store?.name} の詳細</div>
@@ -1975,6 +2028,237 @@ function OrderHubScreen({user, orders, isWeekly, onNav}) {
   );
 }
 
+// ============================================================
+// 管理者：直送・請求書入力画面
+// ============================================================
+function DirectInvoiceScreen({directInvoices, setDirectInvoices, monthlyResults}) {
+  const [selStore, setSelStore] = useState("all");
+  const [selMonth, setSelMonth] = useState(THIS_MONTH);
+  const [showForm, setShowForm] = useState(false);
+  const [editId, setEditId] = useState(null);
+  const blankForm = () => ({
+    id: Date.now(),
+    storeId: STORES_INIT[0].id,
+    month: selMonth,
+    vendor: "",
+    category: "食材",
+    amount: 0,
+    invoiceDate: TODAY,
+    payDate: "",
+    memo: "",
+    note: "",
+    enteredBy: "管理者",
+    createdAt: Date.now(),
+  });
+  const [form, setForm] = useState(blankForm);
+  const setF = (k,v) => setForm(p => ({...p,[k]:v}));
+
+  const invoices = (directInvoices||[]).filter(r =>
+    (selStore==="all" || r.storeId===+selStore) &&
+    (r.month===selMonth)
+  ).sort((a,b) => b.createdAt-a.createdAt);
+
+  const monthKeys = [];
+  for(let m=1;m<=12;m++) monthKeys.push(THIS_YEAR+"-"+String(m).padStart(2,"0"));
+
+  const startEdit = (inv) => {
+    setForm({...inv});
+    setEditId(inv.id);
+    setShowForm(true);
+  };
+  const startNew = () => {
+    setForm({...blankForm(), storeId: selStore==="all"?STORES_INIT[0].id:+selStore, month:selMonth});
+    setEditId(null);
+    setShowForm(true);
+  };
+  const save = () => {
+    if(editId) {
+      setDirectInvoices(p => p.map(r => r.id===editId ? {...form,id:editId} : r));
+    } else {
+      setDirectInvoices(p => [...(p||[]), {...form, id:Date.now(), createdAt:Date.now()}]);
+    }
+    setShowForm(false);
+    setEditId(null);
+  };
+  const del = (id) => {
+    if(!window.confirm("この請求書明細を削除しますか？\n削除すると、この金額は食材費・備品費の計算から外れます。")) return;
+    setDirectInvoices(p => p.filter(r => r.id!==id));
+  };
+
+  // 店舗別入力状況サマリー
+  const statusByStore = STORES_INIT.map(s => {
+    const recs = (directInvoices||[]).filter(r=>r.storeId===s.id&&r.month===selMonth);
+    const result = monthlyResults.find(r=>r.storeId===s.id&&r.month===selMonth);
+    const ckFood = result?.foodOrderCost||0;
+    const ckSupply = result?.supplyOrderCost||0;
+    const dirFood = recs.filter(r=>r.category==="食材").reduce((s,r)=>s+(r.amount||0),0);
+    const dirSupply = recs.filter(r=>r.category==="備品").reduce((s,r)=>s+(r.amount||0),0);
+    return { store:s, count:recs.length, ckFood, ckSupply, dirFood, dirSupply, totalFood:ckFood+dirFood, totalSupply:ckSupply+dirSupply, sales:result?.sales||0 };
+  });
+
+  const totalFoodDirect = invoices.filter(r=>r.category==="食材").reduce((s,r)=>s+(r.amount||0),0);
+  const totalSupplyDirect = invoices.filter(r=>r.category==="備品").reduce((s,r)=>s+(r.amount||0),0);
+
+  return (
+    <div>
+      <div style={{fontSize:17,fontWeight:800,marginBottom:13}}>🧾 直送・請求書入力</div>
+      <div className="al ai" style={{marginBottom:11}}><span>ℹ️</span>CK発注以外の店舗直送食材・備品の請求書分を入力します。食材費率・備品費率の計算に反映されます。</div>
+
+      {/* 絞り込み */}
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:9,marginBottom:11}}>
+        <div>
+          <label className="fl">対象月</label>
+          <select className="fsel" value={selMonth} onChange={e=>setSelMonth(e.target.value)}>
+            {monthKeys.map(k=><option key={k} value={k}>{k}</option>)}
+          </select>
+        </div>
+        <div>
+          <label className="fl">店舗</label>
+          <select className="fsel" value={selStore} onChange={e=>setSelStore(e.target.value)}>
+            <option value="all">全店舗</option>
+            {STORES_INIT.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}
+          </select>
+        </div>
+      </div>
+
+      {/* 入力状況サマリー（全店舗表示時） */}
+      {selStore==="all" && (
+        <div className="card" style={{marginBottom:11}}>
+          <div style={{fontSize:14,fontWeight:800,marginBottom:9}}>{selMonth} 入力状況</div>
+          {statusByStore.map(({store,count,totalFood,totalSupply,sales,ckFood,ckSupply,dirFood,dirSupply})=>{
+            const fr = sales>0?pct(totalFood,sales):0;
+            const sr = sales>0?pct(totalSupply,sales):0;
+            return(
+              <div key={store.id} style={{borderBottom:"1px solid var(--bd)",paddingBottom:9,marginBottom:9}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+                  <div style={{fontWeight:800,fontSize:14}}>{store.name}</div>
+                  <span style={{fontSize:11,padding:"2px 8px",borderRadius:10,background:count>0?"#D1FAE5":"#FEF3C7",color:count>0?"var(--ac)":"#92400E",fontWeight:700}}>{count>0?count+"件入力済":"未入力"}</span>
+                </div>
+                {sales>0&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:4,fontSize:11}}>
+                  <div>食材費計: <b style={{color:fr>30?"var(--dg)":"var(--ac)"}}>¥{fmt(totalFood)} ({fr}%)</b></div>
+                  <div>備品費計: <b>¥{fmt(totalSupply)} ({sr}%)</b></div>
+                  {dirFood>0&&<div style={{color:"var(--tx3)"}}>うち直送: ¥{fmt(dirFood)}</div>}
+                  {dirSupply>0&&<div style={{color:"var(--tx3)"}}>うち直送: ¥{fmt(dirSupply)}</div>}
+                </div>}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* 当月合計 */}
+      {invoices.length>0&&(
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:9,marginBottom:11}}>
+          <div style={{background:"#FFF3E0",border:"1.5px solid #F97316",borderRadius:12,padding:"11px 13px"}}>
+            <div style={{fontSize:11,color:"#E65100",fontWeight:700}}>直送食材費合計</div>
+            <div style={{fontFamily:"'M PLUS Rounded 1c'",fontSize:22,fontWeight:800,color:"var(--pr)"}}>¥{fmt(totalFoodDirect)}</div>
+          </div>
+          <div style={{background:"#F0FDF4",border:"1.5px solid #10B981",borderRadius:12,padding:"11px 13px"}}>
+            <div style={{fontSize:11,color:"var(--ac)",fontWeight:700}}>直送備品費合計</div>
+            <div style={{fontFamily:"'M PLUS Rounded 1c'",fontSize:22,fontWeight:800,color:"var(--ac)"}}>¥{fmt(totalSupplyDirect)}</div>
+          </div>
+        </div>
+      )}
+
+      <button className="btn bpr" style={{marginBottom:11,fontSize:14,padding:"14px"}} onClick={startNew}>➕ 請求書を新規入力する</button>
+
+      {/* 明細一覧 */}
+      {invoices.length===0&&!showForm&&<div className="empty"><div style={{fontSize:32}}>🧾</div><div style={{marginTop:7,fontSize:13}}>この月の直送・請求書明細はまだありません</div></div>}
+      {invoices.map(inv=>{
+        const store=STORES_INIT.find(s=>s.id===inv.storeId);
+        return(
+          <div key={inv.id} className="card" style={{marginBottom:9,borderLeft:"4px solid "+(inv.category==="食材"?"var(--pr)":"var(--ac)")}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:6}}>
+              <div>
+                <div style={{fontWeight:800,fontSize:14}}>{inv.vendor||"（業者名なし）"}</div>
+                <div style={{fontSize:12,color:"var(--tx3)"}}>{store?.name} ｜ {inv.month}</div>
+              </div>
+              <div style={{textAlign:"right"}}>
+                <div style={{fontFamily:"'M PLUS Rounded 1c'",fontSize:20,fontWeight:800,color:inv.category==="食材"?"var(--pr)":"var(--ac)"}}>¥{fmt(inv.amount)}</div>
+                <span style={{fontSize:11,padding:"2px 8px",borderRadius:10,background:inv.category==="食材"?"#FFF3E0":"#ECFDF5",color:inv.category==="食材"?"#E65100":"var(--ac)",fontWeight:700}}>{inv.category}</span>
+              </div>
+            </div>
+            {inv.memo&&<div style={{fontSize:12,color:"var(--tx2)",marginBottom:4}}>📝 {inv.memo}</div>}
+            {inv.invoiceDate&&<div style={{fontSize:11,color:"var(--tx3)"}}>請求書日付: {inv.invoiceDate}</div>}
+            <div style={{display:"flex",gap:7,marginTop:8}}>
+              <button className="btn bsec bxs" style={{fontSize:12}} onClick={()=>startEdit(inv)}>編集</button>
+              <button className="btn bxs" style={{background:"#FEE2E2",color:"#991B1B",border:"1px solid #EF4444",fontSize:12}} onClick={()=>del(inv.id)}>削除</button>
+            </div>
+          </div>
+        );
+      })}
+
+      {/* 入力フォーム */}
+      {showForm&&(
+        <div className="overlay" onClick={e=>e.target===e.currentTarget&&setShowForm(false)}>
+          <div className="sheet">
+            <div style={{fontSize:15,fontWeight:800,marginBottom:13}}>{editId?"請求書明細を編集":"請求書を新規入力"}</div>
+
+            <div className="fg">
+              <label className="fl">店舗</label>
+              <select className="fsel" value={form.storeId} onChange={e=>setF("storeId",+e.target.value)}>
+                {STORES_INIT.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}
+              </select>
+            </div>
+            <div className="fg">
+              <label className="fl">対象月</label>
+              <select className="fsel" value={form.month} onChange={e=>setF("month",e.target.value)}>
+                {monthKeys.map(k=><option key={k} value={k}>{k}</option>)}
+              </select>
+            </div>
+
+            {/* 分類選択（大きなボタン） */}
+            <div className="fg">
+              <label className="fl">分類（食材費・備品費どちらに入れますか？）</label>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:9}}>
+                <button onClick={()=>setF("category","食材")} style={{padding:"16px 10px",borderRadius:12,border:"2px solid "+(form.category==="食材"?"var(--pr)":"var(--bd)"),background:form.category==="食材"?"#FFF3E0":"#fff",color:form.category==="食材"?"var(--pr)":"var(--tx3)",fontWeight:800,fontSize:14,cursor:"pointer",fontFamily:"Noto Sans JP"}}>
+                  🥩 食材費に入れる
+                </button>
+                <button onClick={()=>setF("category","備品")} style={{padding:"16px 10px",borderRadius:12,border:"2px solid "+(form.category==="備品"?"var(--ac)":"var(--bd)"),background:form.category==="備品"?"#ECFDF5":"#fff",color:form.category==="備品"?"var(--ac)":"var(--tx3)",fontWeight:800,fontSize:14,cursor:"pointer",fontFamily:"Noto Sans JP"}}>
+                  📦 備品費に入れる
+                </button>
+              </div>
+            </div>
+
+            <div className="fg">
+              <label className="fl">業者名</label>
+              <input className="fi" value={form.vendor} onChange={e=>setF("vendor",e.target.value)} placeholder="例：〇〇青果、〇〇商店"/>
+            </div>
+            <div className="fg">
+              <label className="fl">金額（円）</label>
+              <input type="number" className="fi" value={form.amount||""} onChange={e=>setF("amount",+e.target.value)} placeholder="例：85000" style={{fontSize:16}}/>
+            </div>
+            <div className="fg">
+              <label className="fl">内容メモ</label>
+              <input className="fi" value={form.memo} onChange={e=>setF("memo",e.target.value)} placeholder="例：野菜直送分（キャベツ、ネギ、大根など）"/>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:9}}>
+              <div className="fg">
+                <label className="fl">請求書日付</label>
+                <input type="date" className="fi" value={form.invoiceDate} onChange={e=>setF("invoiceDate",e.target.value)}/>
+              </div>
+              <div className="fg">
+                <label className="fl">支払予定日</label>
+                <input type="date" className="fi" value={form.payDate} onChange={e=>setF("payDate",e.target.value)}/>
+              </div>
+            </div>
+            <div className="fg">
+              <label className="fl">備考</label>
+              <textarea className="fta" style={{minHeight:52,fontSize:13}} value={form.note} onChange={e=>setF("note",e.target.value)} placeholder="その他メモ"/>
+            </div>
+
+            <div className="dv"/>
+            <button className="btn bpr" style={{marginBottom:7,fontSize:14}} onClick={save} disabled={!form.amount||!form.vendor}>
+              {editId?"変更を保存する":"請求書を登録する"} ✓
+            </button>
+            <button className="btn bsec" onClick={()=>setShowForm(false)}>キャンセル</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Login({onLogin}) {
   const [sel, setSel] = useState("");
   const [pw, setPw] = useState("");
@@ -2024,14 +2308,14 @@ function Login({onLogin}) {
   );
 }
 
-function ManagerDB({user, orders, onNav, storeGoals, yearlyGoals, monthlyResults, weeklyReflects, monthlyReflects}) {
+function ManagerDB({user, orders, onNav, storeGoals, yearlyGoals, monthlyResults, weeklyReflects, monthlyReflects, directInvoices}) {
   const store = STORES_INIT.find(s => s.id === user.storeId);
   const goal  = yearlyGoals.find(g => g.storeId===user.storeId && g.year===THIS_YEAR);
   const result= monthlyResults.find(r => r.storeId===user.storeId && r.month===THIS_MONTH);
   const myO   = orders.find(o => o.storeId===user.storeId && o.orderDate===TODAY && o.status==="submitted");
   const dl    = getDeadline();
 
-  const scoreData = goal && result ? calcManagerScore(result, goal, weeklyReflects, monthlyReflects, user.storeId, THIS_MONTH) : null;
+  const scoreData = goal && result ? calcManagerScore(result, goal, weeklyReflects, monthlyReflects, user.storeId, THIS_MONTH, directInvoices) : null;
   const monthTarget = goal?.monthlySalesTargets?.[THIS_MONTH] || (goal?.annualSalesTarget||0)/12;
   const salesRate = result && monthTarget>0 ? Math.round(result.sales/monthTarget*100) : null;
 
@@ -2817,7 +3101,7 @@ function AllOrders({orders, weeklyOrders, allItems}) {
   );
 }
 
-function AdminDB({orders, weeklyOrders, allItems, yearlyGoals, monthlyResults, weeklyReflects, monthlyReflects, adminComments, setAdminComments, onNav}) {
+function AdminDB({orders, weeklyOrders, allItems, yearlyGoals, monthlyResults, weeklyReflects, monthlyReflects, adminComments, setAdminComments, directInvoices, onNav}) {
   const [selStore, setSelStore] = useState(null);
   const [commentText, setCommentText] = useState("");
   const [commentTarget, setCommentTarget] = useState(null);
@@ -2825,7 +3109,7 @@ function AdminDB({orders, weeklyOrders, allItems, yearlyGoals, monthlyResults, w
   const getStoreData = (storeId) => {
     const goal = yearlyGoals.find(g=>g.storeId===storeId&&g.year===THIS_YEAR);
     const result = monthlyResults.find(r=>r.storeId===storeId&&r.month===THIS_MONTH);
-    const scoreData = goal&&result ? calcManagerScore(result,goal,weeklyReflects,monthlyReflects,storeId,THIS_MONTH) : null;
+    const scoreData = goal&&result ? calcManagerScore(result,goal,weeklyReflects,monthlyReflects,storeId,THIS_MONTH,directInvoices) : null;
     const monthTarget = goal?.monthlySalesTargets?.[THIS_MONTH]||(goal?.annualSalesTarget||0)/12;
     const salesRate = result&&monthTarget>0?Math.round(result.sales/monthTarget*100):null;
     const weekDiag = diagnoseWeek(storeId,orders,weeklyOrders,allItems||[],monthTarget);
@@ -2917,14 +3201,14 @@ function AdminDB({orders, weeklyOrders, allItems, yearlyGoals, monthlyResults, w
 // ============================================================
 // 管理者：要対応画面
 // ============================================================
-function AdminUrgentScreen({orders, weeklyOrders, allItems, yearlyGoals, monthlyResults, weeklyReflects, monthlyReflects, adminComments, setAdminComments}) {
+function AdminUrgentScreen({orders, weeklyOrders, allItems, yearlyGoals, monthlyResults, weeklyReflects, monthlyReflects, adminComments, setAdminComments, directInvoices}) {
   const [commentText, setCommentText] = useState("");
   const [commentTarget, setCommentTarget] = useState(null);
 
   const urgentStores = STORES_INIT.map(store=>{
     const goal=yearlyGoals.find(g=>g.storeId===store.id&&g.year===THIS_YEAR);
     const result=monthlyResults.find(r=>r.storeId===store.id&&r.month===THIS_MONTH);
-    const scoreData=goal&&result?calcManagerScore(result,goal,weeklyReflects,monthlyReflects,store.id,THIS_MONTH):null;
+    const scoreData=goal&&result?calcManagerScore(result,goal,weeklyReflects,monthlyReflects,store.id,THIS_MONTH,directInvoices):null;
     const monthTarget=goal?.monthlySalesTargets?.[THIS_MONTH]||(goal?.annualSalesTarget||0)/12;
     const salesRate=result&&monthTarget>0?Math.round(result.sales/monthTarget*100):null;
     const weekDiag=diagnoseWeek(store.id,orders,weeklyOrders,allItems||[],monthTarget);
@@ -3647,6 +3931,9 @@ export default function App() {
   const [adminComments, setAdminComments] = useState(() =>
     loadStorage(STORAGE_KEYS.adminComments, [])
   );
+  const [directInvoices, setDirectInvoices] = useState(() =>
+    loadStorage(STORAGE_KEYS.directInvoices, [])
+  );
 
   useEffect(() => { saveStorage(STORAGE_KEYS.orders,          orders);          }, [orders]);
   useEffect(() => { saveStorage(STORAGE_KEYS.weeklyOrders,    weeklyOrders);    }, [weeklyOrders]);
@@ -3658,6 +3945,7 @@ export default function App() {
   useEffect(() => { saveStorage(STORAGE_KEYS.weeklyReflects,  weeklyReflects);  }, [weeklyReflects]);
   useEffect(() => { saveStorage(STORAGE_KEYS.monthlyReflects, monthlyReflects); }, [monthlyReflects]);
   useEffect(() => { saveStorage(STORAGE_KEYS.adminComments,   adminComments);   }, [adminComments]);
+  useEffect(() => { saveStorage(STORAGE_KEYS.directInvoices,  directInvoices);  }, [directInvoices]);
 
   const login = useCallback(u => { setUser(u); setScreen("dashboard"); }, []);
   const logout = useCallback(() => { setUser(null); setScreen("dashboard"); }, []);
@@ -3680,7 +3968,7 @@ export default function App() {
     mgr_daily:  [{k:"dashboard",i:"🏠",l:"ホーム"},{k:"orderHub",i:"📋",l:"発注"},{k:"weeklyReflect",i:"📝",l:"振り返り"},{k:"incentiveCheck",i:"🏆",l:"評価"}],
     mgr_weekly: [{k:"dashboard",i:"🏠",l:"ホーム"},{k:"orderHub",i:"📋",l:"発注"},{k:"weeklyReflect",i:"📝",l:"振り返り"},{k:"incentiveCheck",i:"🏆",l:"評価"}],
     ck:    [{k:"dashboard",i:"🏠",l:"ホーム"},{k:"allOrders",i:"📋",l:"発注一覧"},{k:"prepList",i:"🥬",l:"仕込み"},{k:"deliveryList",i:"🚚",l:"配送"},{k:"cabbage",i:"🥦",l:"キャベツ"},{k:"weeklyManage",i:"📦",l:"則武店"}],
-    admin: [{k:"dashboard",i:"🏠",l:"全店舗"},{k:"adminUrgent",i:"⚠️",l:"要対応"},{k:"adminReflect",i:"📝",l:"振り返り"},{k:"yearlyGoal",i:"🎯",l:"目標設定"},{k:"adminOrders",i:"📋",l:"発注管理"},{k:"masterAdmin",i:"⚙️",l:"商品管理"}],
+    admin: [{k:"dashboard",i:"🏠",l:"全店舗"},{k:"adminUrgent",i:"⚠️",l:"要対応"},{k:"adminReflect",i:"📝",l:"振り返り"},{k:"yearlyGoal",i:"🎯",l:"目標設定"},{k:"adminOrders",i:"📋",l:"発注管理"},{k:"directInvoice",i:"🧾",l:"直送入力"},{k:"masterAdmin",i:"⚙️",l:"商品管理"}],
   };
   const navKey = user.role==="manager" ? (isWeekly?"mgr_weekly":"mgr_daily") : user.role;
   const navItems = navCfg[navKey] || navCfg.mgr_daily;
@@ -3688,12 +3976,12 @@ export default function App() {
 
   const renderScreen = () => {
     if (user.role === "manager" && !isWeekly) {
-      if (screen==="dashboard")       return <ManagerDB user={user} orders={orders} onNav={nav} storeGoals={storeGoals} yearlyGoals={yearlyGoals} monthlyResults={monthlyResults} weeklyReflects={weeklyReflects} monthlyReflects={monthlyReflects} />;
+      if (screen==="dashboard")       return <ManagerDB user={user} orders={orders} onNav={nav} storeGoals={storeGoals} yearlyGoals={yearlyGoals} monthlyResults={monthlyResults} weeklyReflects={weeklyReflects} monthlyReflects={monthlyReflects} directInvoices={directInvoices} />;
       if (screen==="orderHub")        return <OrderHubScreen user={user} orders={orders} isWeekly={false} onNav={nav} />;
       if (screen==="foodOrder")       return <FoodOrder {...cp} />;
       if (screen==="supplyOrder")     return <SupplyOrder {...cp} />;
       if (screen==="deliveryConfirm") return <DelivConf user={user} orders={orders} setOrders={setOrders} allItems={allItems} />;
-      if (screen==="incentiveCheck")  return <IncentiveCheckScreen user={user} yearlyGoals={yearlyGoals} monthlyResults={monthlyResults} weeklyReflects={weeklyReflects} monthlyReflects={monthlyReflects} />;
+      if (screen==="incentiveCheck")  return <IncentiveCheckScreen user={user} yearlyGoals={yearlyGoals} monthlyResults={monthlyResults} weeklyReflects={weeklyReflects} monthlyReflects={monthlyReflects} directInvoices={directInvoices} />;
       if (screen==="weeklyReflect")   return <WeeklyReflectScreen user={user} weeklyReflects={weeklyReflects} setWeeklyReflects={setWeeklyReflects} adminComments={adminComments} orders={orders} weeklyOrders={weeklyOrders} allItems={allItems} yearlyGoals={yearlyGoals} monthlyResults={monthlyResults} />;
     }
     if (user.role === "manager" && isWeekly) {
@@ -3702,7 +3990,7 @@ export default function App() {
       if (screen==="weeklyOrder")     return <WeeklyOrder user={user} allItems={allItems} storeVisIds={storeVisIds} weeklyOrders={weeklyOrders} setWeeklyOrders={setWeeklyOrders} onNav={nav} />;
       if (screen==="supplyOrder")     return <SupplyOrder {...cp} />;
       if (screen==="deliveryConfirm") return <div><div className="sect">✅ 納品確認</div><div className="al awk"><span>📦</span>則武店の納品確認はCKから配送予定が届いた後に確認できます。</div></div>;
-      if (screen==="incentiveCheck")  return <IncentiveCheckScreen user={user} yearlyGoals={yearlyGoals} monthlyResults={monthlyResults} weeklyReflects={weeklyReflects} monthlyReflects={monthlyReflects} />;
+      if (screen==="incentiveCheck")  return <IncentiveCheckScreen user={user} yearlyGoals={yearlyGoals} monthlyResults={monthlyResults} weeklyReflects={weeklyReflects} monthlyReflects={monthlyReflects} directInvoices={directInvoices} />;
       if (screen==="weeklyReflect")   return <WeeklyReflectScreen user={user} weeklyReflects={weeklyReflects} setWeeklyReflects={setWeeklyReflects} adminComments={adminComments} orders={orders} weeklyOrders={weeklyOrders} allItems={allItems} yearlyGoals={yearlyGoals} monthlyResults={monthlyResults} />;
     }
     if (user.role === "ck") {
@@ -3714,19 +4002,20 @@ export default function App() {
       if (screen==="weeklyManage")  return <WeeklyManage weeklyOrders={weeklyOrders} setWeeklyOrders={setWeeklyOrders} allItems={allItems} />;
     }
     if (user.role === "admin") {
-      const adminCommonProps = {orders,weeklyOrders,allItems,yearlyGoals,monthlyResults,weeklyReflects,monthlyReflects,adminComments,setAdminComments};
+      const adminCommonProps = {orders,weeklyOrders,allItems,yearlyGoals,monthlyResults,weeklyReflects,monthlyReflects,adminComments,setAdminComments,directInvoices};
       if (screen==="dashboard")    return <AdminDB {...adminCommonProps} onNav={nav} />;
       if (screen==="adminUrgent")  return <AdminUrgentScreen {...adminCommonProps} />;
       if (screen==="adminReflect") return <AdminReflectScreen {...adminCommonProps} setAdminComments={setAdminComments} />;
       if (screen==="yearlyGoal")   return <YearlyGoalAdmin yearlyGoals={yearlyGoals} setYearlyGoals={setYearlyGoals} monthlyResults={monthlyResults} setMonthlyResults={setMonthlyResults} orders={orders} weeklyOrders={weeklyOrders} allItems={allItems} />;
       if (screen==="adminOrders")  return <AdminOrderSummary orders={orders} weeklyOrders={weeklyOrders} allItems={allItems} onNav={nav} />;
-      if (screen==="allIncentive") return <AllStoreIncentiveScreen yearlyGoals={yearlyGoals} monthlyResults={monthlyResults} weeklyReflects={weeklyReflects} monthlyReflects={monthlyReflects} adminComments={adminComments} setAdminComments={setAdminComments} />;
+      if (screen==="allIncentive") return <AllStoreIncentiveScreen yearlyGoals={yearlyGoals} monthlyResults={monthlyResults} weeklyReflects={weeklyReflects} monthlyReflects={monthlyReflects} adminComments={adminComments} setAdminComments={setAdminComments} directInvoices={directInvoices} />;
       if (screen==="goalSetting")  return <GoalSettingAdmin storeGoals={storeGoals} setStoreGoals={setStoreGoals} />;
       if (screen==="monthly")      return <Monthly />;
       if (screen==="incentive")    return <Incentive />;
       if (screen==="lateOrders")   return <LateOrders orders={orders} />;
       if (screen==="csvExport")    return <CsvExportScreen orders={orders} weeklyOrders={weeklyOrders} allItems={allItems} storeGoals={storeGoals} yearlyGoals={yearlyGoals} monthlyResults={monthlyResults} />;
       if (screen==="masterAdmin")  return <MasterAdmin allItems={allItems} setAllItems={setAllItems} storeVisIds={storeVisIds} setStoreVisIds={setStoreVisIds} />;
+      if (screen==="directInvoice") return <DirectInvoiceScreen directInvoices={directInvoices} setDirectInvoices={setDirectInvoices} monthlyResults={monthlyResults} />;
       if (screen==="storeAdmin")   return <StoreAdmin />;
       if (screen==="allOrders")    return <AllOrders orders={orders} weeklyOrders={weeklyOrders} allItems={allItems} />;
       if (screen==="prepList")     return <PrepList orders={orders} allItems={allItems} />;
