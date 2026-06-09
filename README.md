@@ -1,16 +1,72 @@
-# React + Vite
+# CK発注システム - たくあんグループ
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+## ファイル構成
 
-Currently, two official plugins are available:
+```
+takuan_ordering_v3.html  ← アプリ本体（1ファイルで完結）
+vercel.json              ← Vercel公開用設定
+README.md                ← この説明書
+```
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## Vercelで公開する手順
 
-## React Compiler
+1. GitHubに新しいリポジトリを作る（例: `takuan-ck-order`）
+2. 以下の3ファイルをリポジトリにアップロード
+   - `takuan_ordering_v3.html`
+   - `vercel.json`
+   - `README.md`（任意）
+3. https://vercel.com にログイン（無料アカウントでOK）
+4. 「Add New Project」→ GitHubのリポジトリを選択
+5. 設定はそのまま「Deploy」をクリック
+6. 数分でURLが発行される（例: `https://takuan-ck-order.vercel.app`）
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## 店舗への共有方法
 
-## Expanding the ESLint configuration
+- 発行されたURLをLINE・メールで各店長に送る
+- スマホでブックマーク（ホーム画面に追加）してもらうと便利
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+## アプリ更新方法
+
+1. `takuan_ordering_v3.html` を修正
+2. GitHubにプッシュ（または手動でファイルを上書きアップロード）
+3. Vercelが自動でデプロイ（約1〜2分で反映）
+
+## データの保存について
+
+現在の保存方式: **ブラウザのlocalStorage + sessionStorage（二重保存）**
+
+### メリット
+- サーバー不要で今日から使える
+- 完全無料
+- ネットが遅い場所でも動く
+
+### 注意点
+- ブラウザの「履歴・キャッシュを消去」をすると保存データが消える
+- 別の端末からは同じデータは見えない（端末ごとに保存）
+- CKが確認するには、CKの端末でログインする
+
+### 将来的な改善（今回は未実装）
+Supabase（無料）などのデータベースと接続すれば、
+どの端末からでも同じデータが見えるようになる。
+接続先URL（環境変数）を1行追加するだけで対応可能。
+
+## ログイン情報（現在はデモ用・パスワードなし）
+
+| 役割 | 操作 |
+|------|------|
+| 店長 | 役割選択→店舗選択→ログイン |
+| CK担当 | 役割選択→ログイン |
+| 管理者 | 役割選択→ログイン |
+
+## 動作確認チェックリスト
+
+- [ ] スマホで発注できるか
+- [ ] PCで管理画面が見られるか
+- [ ] 発注内容が送信できるか
+- [ ] 発注履歴が見られるか
+- [ ] 「本日は発注なし」が送れるか
+- [ ] CK画面で店舗状況が見えるか
+- [ ] 商品合計が表示されるか
+- [ ] 出荷チェックができるか
+- [ ] CSVが出力できるか
+

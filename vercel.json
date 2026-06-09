@@ -1,0 +1,9 @@
+{
+  "version": 2,
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "/takuan_ordering_v3.html"
+    }
+  ]
+}
